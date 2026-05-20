@@ -1,0 +1,145 @@
+name: Release texture pack
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Run release check manually'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Detect repo changes since latest tag
+        id: changes
+        shell: bash
+        run: |
+          git fetch --tags --force
+
+          latest_tag=$(git tag --sort=-v:refname | head -n1 || true)
+          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$latest_tag" ]; then
+            echo "No existing tag found. A new release will be created."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          diff_output=$(git diff --name-status "$latest_tag" HEAD || true)
+
+          if [ -n "$diff_output" ]; then
+            echo "Changes detected since tag $latest_tag:"
+            echo "$diff_output"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No repository changes detected since tag $latest_tag."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop when no releasable changes are found
+        if: steps.changes.outputs.changed != 'true'
+        run: |
+          echo "No file content or filename changes found since the latest tag. Skipping tag and release."
+
+      - name: Verify texture asset directories exist
+        if: steps.changes.outputs.changed == 'true'
+        shell: bash
+        run: |
+          missing=0
+          for d in atlas image others; do
+            if [ ! -d "$d" ]; then
+              echo "Missing required directory: $d"
+              missing=1
+            fi
+          done
+          if [ "$missing" = "1" ]; then
+            echo "Texture asset directories are not yet populated. Skipping release."
+            echo "SKIP_RELEASE=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Bump version
+        if: steps.changes.outputs.changed == 'true' && env.SKIP_RELEASE != '1'
+        id: bump
+        shell: bash
+        run: |
+          if [ ! -f texture_version.txt ]; then
+            echo "texture_version.txt not found at repository root"
+            exit 1
+          fi
+
+          current_version=$(tr -d '[:space:]' < texture_version.txt)
+          IFS='.' read -r major minor patch <<< "$current_version"
+
+          if [ -z "$major" ] || [ -z "$minor" ] || [ -z "$patch" ]; then
+            echo "Invalid version format in texture_version.txt: $current_version"
+            exit 1
+          fi
+
+          new_version="$major.$minor.$((patch + 1))"
+          echo "$new_version" > texture_version.txt
+
+          echo "current_version=$current_version" >> "$GITHUB_OUTPUT"
+          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+
+      - name: Commit bumped version
+        if: steps.changes.outputs.changed == 'true' && env.SKIP_RELEASE != '1'
+        run: |
+          git add texture_version.txt
+          git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }}"
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Create release archive
+        if: steps.changes.outputs.changed == 'true' && env.SKIP_RELEASE != '1'
+        run: |
+          rm -rf build texture2d.zip
+          mkdir -p build/texture2d
+
+          cp -r atlas build/texture2d/
+          cp -r image build/texture2d/
+          cp -r others build/texture2d/
+          cp texture_version.txt build/texture2d/
+
+          cd build
+          zip -r texture2d.zip texture2d
+          mv texture2d.zip ../
+
+      - name: Generate checksum
+        if: steps.changes.outputs.changed == 'true' && env.SKIP_RELEASE != '1'
+        run: |
+          sha256sum texture2d.zip > SHA256SUMS
+
+      - name: Create and push tag
+        if: steps.changes.outputs.changed == 'true' && env.SKIP_RELEASE != '1'
+        run: |
+          git tag "${{ steps.bump.outputs.new_version }}"
+          git push origin "${{ steps.bump.outputs.new_version }}"
+
+      - name: Create release
+        if: steps.changes.outputs.changed == 'true' && env.SKIP_RELEASE != '1'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.bump.outputs.new_version }}" texture2d.zip SHA256SUMS \
+            --title "${{ steps.bump.outputs.new_version }}" \
+            --notes "Automated release for version ${{ steps.bump.outputs.new_version }}"
